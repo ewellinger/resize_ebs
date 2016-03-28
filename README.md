@@ -4,7 +4,7 @@ The Purpose of this script is to resize the root Elastic Block Storage (EBS) of 
 
 ### SYNOPSIS
 ```sh
-sh resize_ebs [vS] -i [instance-id] -s [size]   
+sh resize_ebs [-vS] -i [instance-id] -s [size]   
 ```
 
 The options are as follows:
