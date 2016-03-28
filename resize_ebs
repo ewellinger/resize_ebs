@@ -1,0 +1,153 @@
+#!/bin/bash
+
+# The Purpose of this script is to resize the root Elastic Block Storage (EBS) of an already running AWS instance
+# Written by Erich Wellinger
+# github.com/ewellinger
+
+while getopts ":hvSi:s:" opt; do
+    case $opt in
+        i)
+            instanceid=$OPTARG
+            echo "\t Instance-Id: $instanceid"
+            ;;
+        s)
+            size=$OPTARG
+            echo "\t Size of New EBS: $size GB"
+            ;;
+        S)
+            deleteSnapshot=True
+            echo "\t Deleting snapshot following completion"
+            ;;
+        v)
+            deleteVolume=True
+            echo "\t Deleting old volume following completion"
+            ;;
+        h)
+            echo "SYNOPSIS"
+            echo "\t sh resize_ebs [vS] -i [instance-id] -s [size]"
+            echo "\n"
+            echo "DESCRIPTION"
+            echo "\tThe purpose of this script is to resize the root Elastic Block Storage (EBS) of an already running AWS Instance"
+            echo "\n"
+            echo "The options are as follows:"
+            echo "-i [instance-id]"
+            echo "\t\tSpecifies the Instance ID of the AWS instance to be resized\n"
+            echo "-s [size]"
+            echo "\t\tSpecifies the size, in GB, to resize the EBS to\n"
+            echo "-v\t\tDelete the old volume following the completion of the script\n"
+            echo "-S\t\tDelete the snapshot of the old volume following the completion of the script (You may wish to keep this"
+            echo "\t\tuntil you're sure everything is working as intended)\n"
+            echo "NOTE"
+            echo "\tThis script assumes you have the AWS CLI tools installed, the instance you wish to resize is running in the same"
+            echo "\tregion as specified in your AWS config file, and that your pem file is stored in ~/.ssh/\n"
+            echo "\tYou may need to alter the permissions of this file to be executable using the following command:"
+            echo "\t\t$ chmod +x resize_ebs"
+            exit 1
+            ;;
+        \?)
+            echo "usage: sh resize_ebs [-vS] -i [instance-id] -s [size]"
+            exit 1
+            ;;
+        :)
+            echo "\t Option -$OPTARG requires an argument." >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z ${instanceid+x} ]; then
+    echo "\t Error: You must specify the Instance ID with the -i flag"
+    exit 1
+fi
+if [ -z ${size+x} ]; then
+    echo "\t Error: You must specify the size of the new EBS with the -s flag"
+    exit 1
+fi
+
+# Get information about our instance id
+result=$(aws ec2 describe-instances --instance-ids $instanceid)
+
+oldvolumeid=$(echo $result | jq -r '.Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId')
+zone=$(echo $result | jq -r '.Reservations[0].Instances[0].Placement.AvailabilityZone')
+
+# Print out what we know so far about this instance
+echo "Instance $instanceid in $zone with original volume $oldvolumeid"
+
+# Stop our instance so we can detach our volume, resize, and reattach
+aws ec2 stop-instances --instance-id $instanceid
+
+# Wait until the instance actually stops
+while
+aws ec2 describe-instances --instance-ids $instanceid | jq -r '.Reservations[0].Instances[0].State.Name' | grep -q stopping;
+do
+    sleep 5;
+done
+echo "Instance $instanceid stopped..."
+
+# Detach the original volume from the instance
+aws ec2 detach-volume --volume-id $oldvolumeid
+
+# Make sure that the volume is available
+while ! aws ec2 describe-volumes --volume-ids $oldvolumeid | jq -r '.Volumes[0].State' | grep -q available;
+do
+    sleep 5;
+done
+echo "Volume $oldvolumeid detached..."
+
+# Create a snapshot of the original volume
+snapshotid=$(aws ec2 create-snapshot --volume-id $oldvolumeid | jq -r '.SnapshotId')
+while aws ec2 describe-snapshots --snapshot-ids $snapshotid | jq -r '.Snapshots[0].State' | grep -q pending;
+do
+    sleep 10;
+done
+echo "Snapshot $snapshotid created..."
+
+# Creating a new volume of the snapshot, specifying the larger size
+newvolumeid=$(aws ec2 create-volume \
+  --availability-zone $zone \
+  --size $size \
+  --snapshot $snapshotid |
+  jq -r '.VolumeId')
+while ! aws ec2 describe-volumes --volume-ids $newvolumeid | jq -r '.Volumes[0].State' | grep -q available;
+do
+    sleep 5;
+done
+echo "New volume $newvolumeid with $size GB created..."
+
+# Attach the new volume to the instance
+aws ec2 attach-volume \
+    --instance-id $instanceid \
+    --volume-id $newvolumeid \
+    --device /dev/sda1
+while ! aws ec2 describe-volumes --volume-ids $newvolumeid | jq -r '.Volumes[0].State' | grep -q in-use
+do
+    sleep 5;
+done
+echo "Volume $newvolumeid attached to instance $instanceid..."
+
+# Start the instance (Might need to re-assign the elastic IP address to the instance here...)
+aws ec2 start-instances --instance-ids $instanceid
+while ! aws ec2 describe-instances --instance-ids $instanceid | jq -r '.Reservations[0].Instances[0].State.Name' | grep -q running;
+do
+    sleep 10;
+done
+echo "Instance $instanceid started..."
+
+# ssh into the new instance and resize the root file system to fill the new EBS volume.
+result=$(aws ec2 describe-instances --instance-ids $instanceid)
+ip=$(echo $result | jq -r '.Reservations[0].Instances[0].PublicIpAddress')
+pem=$(echo $result | jq -r '.Reservations[0].Instances[0].KeyName')
+ssh -i ~/.ssh/$pem.pem ubuntu@$ip 'sudo resize2fs /dev/sda1'
+ssh -i ~/.ssh/$pem.pem ubuntu@$ip 'sudo resize2fs /dev/xvda1'
+
+echo "Done"
+
+# Delete the old volume if -v option is given
+if [ -z "$deleteVolume" ]; then
+    aws ec2 delete-volume --volume-id $oldvolumeid
+fi
+
+# Delete the created snapshot if -S option is given
+if [ -z "$deleteSnapshot" ]; then
+    aws ec2 delete-snapshot --snapshot-id $snapshotid
+fi
